@@ -3,7 +3,11 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -26,6 +30,7 @@ func (a fakeAgent) Run(ctx context.Context, task store.Task, dir string) (store.
 }
 
 func TestRun(t *testing.T) {
+	t.Setenv("TROUPE_WEBHOOK_URL", "")
 	for _, tt := range []struct {
 		name         string
 		agentName    string
@@ -118,7 +123,7 @@ func TestRun(t *testing.T) {
 			args := []string{"run", "--agent", tt.agentName, "--goal", wantTask.Goal, "--store", root}
 			args = append(args, tt.flags...)
 			var stdout, stderr bytes.Buffer
-			code := execute(context.Background(), args, &stdout, &stderr, map[string]agent.Agent{a.Name(): a, other.Name(): other})
+			code := execute(context.Background(), args, &stdout, &stderr, map[string]agent.Agent{a.Name(): a, other.Name(): other}, nil)
 			if code != tt.code || calls != 1 {
 				t.Fatalf("exit = %d, agent calls = %d; want %d, 1; stderr: %s", code, calls, tt.code, &stderr)
 			}
@@ -179,7 +184,7 @@ func TestValidation(t *testing.T) {
 				return store.Result{}, nil
 			}}
 			var stdout, stderr bytes.Buffer
-			if code := execute(context.Background(), tt.args, &stdout, &stderr, map[string]agent.Agent{a.Name(): a}); code != 1 {
+			if code := execute(context.Background(), tt.args, &stdout, &stderr, map[string]agent.Agent{a.Name(): a}, nil); code != 1 {
 				t.Fatalf("exit = %d; want 1", code)
 			}
 			if !strings.Contains(stderr.String(), tt.err) || !strings.Contains(stderr.String(), "Usage:") || stdout.Len() != 0 {
@@ -221,7 +226,7 @@ func TestStorePrecedence(t *testing.T) {
 				args = append(args, "--store", tt.flag)
 			}
 			var stdout, stderr bytes.Buffer
-			if code := execute(context.Background(), args, &stdout, &stderr, map[string]agent.Agent{a.Name(): a}); code != 0 {
+			if code := execute(context.Background(), args, &stdout, &stderr, map[string]agent.Agent{a.Name(): a}, nil); code != 0 {
 				t.Fatalf("exit = %d; stderr: %s", code, &stderr)
 			}
 			if task, err := openStore(t, root).GetTask(context.Background(), "task-1"); err != nil || task.Status != store.StatusDone {
@@ -273,7 +278,7 @@ func TestStoreErrors(t *testing.T) {
 			}}
 			args := []string{"run", "--goal", "task", "--agent", "codex", "--store", root, "--id", tt.id}
 			var stdout, stderr bytes.Buffer
-			if code := execute(context.Background(), args, &stdout, &stderr, map[string]agent.Agent{a.Name(): a}); code != 1 || !strings.Contains(stderr.String(), tt.err) {
+			if code := execute(context.Background(), args, &stdout, &stderr, map[string]agent.Agent{a.Name(): a}, nil); code != 1 || !strings.Contains(stderr.String(), tt.err) {
 				t.Fatalf("exit = %d, stderr = %q; want 1 and %q", code, &stderr, tt.err)
 			}
 			if tt.name == "existing task" {
@@ -322,8 +327,109 @@ func TestOutputError(t *testing.T) {
 	}}
 	var stderr bytes.Buffer
 	args := []string{"run", "--goal", "task", "--agent", "codex", "--store", root}
-	if code := execute(context.Background(), args, failingWriter{}, &stderr, map[string]agent.Agent{a.Name(): a}); code != 1 || !strings.Contains(stderr.String(), "write result: output unavailable") {
+	if code := execute(context.Background(), args, failingWriter{}, &stderr, map[string]agent.Agent{a.Name(): a}, nil); code != 1 || !strings.Contains(stderr.String(), "write result: output unavailable") {
 		t.Fatalf("exit = %d, stderr = %q; want output error", code, &stderr)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestBlockedWebhook(t *testing.T) {
+	const envURL = "https://notify.example/env?source=troupe"
+	const flagURL = "https://notify.example/flag?source=troupe"
+	for _, tt := range []struct {
+		name         string
+		status       store.ResultStatus
+		env          string
+		flags        []string
+		wantURL      string
+		code         int
+		responseCode int
+		clientErr    error
+		agentErr     error
+		outputError  bool
+		wantErr      string
+	}{
+		{name: "blocked flag wins", status: store.ResultStatusBlocked, env: envURL, flags: []string{"--webhook-url", flagURL}, wantURL: flagURL, code: 1},
+		{name: "blocked environment", status: store.ResultStatusBlocked, env: envURL, wantURL: envURL, code: 1},
+		{name: "blocked no URL", status: store.ResultStatusBlocked, code: 1},
+		{name: "empty flag disables environment", status: store.ResultStatusBlocked, env: envURL, flags: []string{"--webhook-url="}, code: 1},
+		{name: "failed", status: store.ResultStatusFailed, env: envURL, code: 1},
+		{name: "done", status: store.ResultStatusDone, env: envURL},
+		{name: "notify HTTP error", status: store.ResultStatusBlocked, env: envURL, wantURL: envURL, responseCode: http.StatusServiceUnavailable, code: 1, wantErr: "notify blocked task \"task-1\": blocked webhook returned 503 Service Unavailable: try later"},
+		{name: "notify client error", status: store.ResultStatusBlocked, env: envURL, wantURL: envURL, clientErr: errors.New("network unavailable"), code: 1, wantErr: "notify blocked task \"task-1\": post blocked webhook"},
+		{name: "agent error with blocked partial result", status: store.ResultStatusBlocked, env: envURL, agentErr: errors.New("agent stopped"), code: 1, wantErr: "agent stopped"},
+		{name: "blocked with output error", status: store.ResultStatusBlocked, env: envURL, wantURL: envURL, code: 1, outputError: true, wantErr: "write result: output unavailable"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("TROUPE_WEBHOOK_URL", tt.env)
+			root := t.TempDir()
+			taskGoal := "Implement a bounded task"
+			result := store.Result{ID: "task-1", Status: tt.status, Summary: "Agent summary", Commit: "abc123", Notes: "Need a decision\n请确认"}
+			a := fakeAgent{name: "codex", run: func(context.Context, store.Task, string) (store.Result, error) {
+				return result, tt.agentErr
+			}}
+			calls := 0
+			client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.URL.String() != tt.wantURL || r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
+					t.Fatalf("unexpected request: %s %s, Content-Type = %q; want POST %s", r.Method, r.URL, r.Header.Get("Content-Type"), tt.wantURL)
+				}
+				var got map[string]string
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+					t.Fatal(err)
+				}
+				want := map[string]string{"task_id": "task-1", "status": "blocked", "summary": result.Summary, "notes": result.Notes, "goal": taskGoal}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("payload = %#v; want %#v", got, want)
+				}
+				if saved, err := openStore(t, root).GetTask(r.Context(), result.ID); err != nil || saved.Status != store.StatusBlocked {
+					t.Fatalf("task at notification = %#v, %v; want persisted blocked task", saved, err)
+				}
+				if tt.clientErr != nil {
+					return nil, tt.clientErr
+				}
+				w := httptest.NewRecorder()
+				status := tt.responseCode
+				if status == 0 {
+					status = http.StatusNoContent
+				}
+				w.WriteHeader(status)
+				if status >= 300 {
+					io.WriteString(w, "try later")
+				}
+				return w.Result(), nil
+			})}
+			args := []string{"run", "--agent", a.Name(), "--goal", taskGoal, "--id", result.ID, "--store", root}
+			args = append(args, tt.flags...)
+			var stdout, stderr bytes.Buffer
+			var output io.Writer = &stdout
+			if tt.outputError {
+				output = failingWriter{}
+			}
+			code := execute(context.Background(), args, output, &stderr, map[string]agent.Agent{a.Name(): a}, client)
+			wantCalls := 0
+			if tt.wantURL != "" {
+				wantCalls = 1
+			}
+			if code != tt.code || calls != wantCalls {
+				t.Fatalf("exit = %d, POSTs = %d; want %d, %d; stderr: %s", code, calls, tt.code, wantCalls, &stderr)
+			}
+			if tt.wantErr == "" && stderr.Len() != 0 || tt.wantErr != "" && !strings.Contains(stderr.String(), tt.wantErr) {
+				t.Fatalf("stderr = %q; want error %q", &stderr, tt.wantErr)
+			}
+			if tt.clientErr != nil && !strings.Contains(stderr.String(), tt.clientErr.Error()) {
+				t.Fatalf("stderr = %q; want client error", &stderr)
+			}
+			if !tt.outputError {
+				wantOutput := "ID: task-1\nStatus: " + string(tt.status) + "\nSummary: Agent summary\nCommit: abc123\nNotes: " + result.Notes + "\n"
+				if stdout.String() != wantOutput {
+					t.Fatalf("stdout = %q; want %q", &stdout, wantOutput)
+				}
+			}
+		})
 	}
 }
 
