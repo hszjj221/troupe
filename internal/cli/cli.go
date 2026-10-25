@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,7 +20,7 @@ import (
 	"github.com/hszjj221/troupe/internal/store"
 )
 
-const usage = "Usage:\n  troupe run --agent <codex|claude> --goal <goal> [flags]\n  troupe resume <id> --agent <codex|claude> [flags]\nRun 'troupe run --help' or 'troupe resume --help' for flags."
+const usage = "Usage:\n  troupe run --agent <codex|claude> --goal <goal> [flags]\n  troupe resume <id> --agent <codex|claude> [flags]\n  troupe status <id> [--store <root>]\n  troupe list [--status pending|running|blocked|done|failed] [--store <root>]\nRun 'troupe <command> --help' for flags (run, resume, status, list)."
 
 const maxBudgetMinutes = int64((1<<63 - 1) / time.Minute)
 
@@ -37,7 +38,7 @@ func defaultAgents() map[string]agent.Agent {
 
 func execute(ctx context.Context, args []string, stdout, stderr io.Writer, agents map[string]agent.Agent, client *http.Client) int {
 	if len(args) == 0 {
-		code := fail(stderr, "expected run or resume subcommand")
+		code := fail(stderr, "expected run, resume, status, or list subcommand")
 		fmt.Fprintln(stderr, usage)
 		return code
 	}
@@ -54,6 +55,10 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, agent
 		return run(ctx, args[1:], stdout, stderr, agents, client)
 	case "resume":
 		return resume(ctx, args[1:], stdout, stderr, agents, client)
+	case "status":
+		return status(ctx, args[1:], stdout, stderr)
+	case "list":
+		return list(ctx, args[1:], stdout, stderr)
 	default:
 		code := fail(stderr, "unknown subcommand %q", args[0])
 		fmt.Fprintln(stderr, usage)
@@ -235,6 +240,131 @@ func resume(ctx context.Context, args []string, stdout, stderr io.Writer, agents
 	}
 	task.Status = store.StatusPending
 	return runTask(ctx, task, agentName, fs, root, webhookURL, stdout, stderr, agents, client)
+}
+
+func status(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	root := os.Getenv("TROUPE_HOME")
+	if root == "" {
+		root = ".troupe"
+	}
+	flags := flag.NewFlagSet("troupe status", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: troupe status <id> [--store <root>]")
+		flags.PrintDefaults()
+	}
+	flags.StringVar(&root, "store", root, "store root (flag > TROUPE_HOME > .troupe)")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 1
+	}
+	invalid := func(format string, args ...any) int {
+		code := fail(stderr, format, args...)
+		flags.Usage()
+		return code
+	}
+	if flags.NArg() == 0 {
+		return invalid("task ID is required")
+	}
+	taskID := flags.Arg(0)
+	// As with resume, allow flags before or after the single task ID.
+	if err := flags.Parse(flags.Args()[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 1
+	}
+	if flags.NArg() != 0 {
+		return invalid("expected exactly one task ID; unexpected positional arguments")
+	}
+	if strings.TrimSpace(root) == "" {
+		return invalid("--store must not be empty")
+	}
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return fail(stderr, "resolve store root: %v", err)
+	}
+	fs, err := store.NewFileStore(root)
+	if err != nil {
+		return fail(stderr, "open store: %v", err)
+	}
+	task, err := fs.GetTask(ctx, taskID)
+	if err != nil {
+		return fail(stderr, "load task %q: %v", taskID, err)
+	}
+	if _, err := fmt.Fprintf(stdout, "ID: %s\nStatus: %s\nGoal: %s\nRole: %s\nWorkdir: %s\n",
+		task.ID, task.Status, task.Goal, task.Role, task.Workdir); err != nil {
+		return fail(stderr, "write task: %v", err)
+	}
+	return 0
+}
+
+func list(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	root := os.Getenv("TROUPE_HOME")
+	if root == "" {
+		root = ".troupe"
+	}
+	var taskStatus string
+	flags := flag.NewFlagSet("troupe list", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: troupe list [--status pending|running|blocked|done|failed] [--store <root>]")
+		flags.PrintDefaults()
+	}
+	flags.StringVar(&taskStatus, "status", "", "filter by status: pending, running, blocked, done, failed (default all)")
+	flags.StringVar(&root, "store", root, "store root (flag > TROUPE_HOME > .troupe)")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 1
+	}
+	invalid := func(format string, args ...any) int {
+		code := fail(stderr, format, args...)
+		flags.Usage()
+		return code
+	}
+	if flags.NArg() != 0 {
+		return invalid("unexpected positional arguments")
+	}
+	statusSet := false
+	flags.Visit(func(f *flag.Flag) { statusSet = statusSet || f.Name == "status" })
+	if statusSet {
+		switch store.Status(taskStatus) {
+		case store.StatusPending, store.StatusRunning, store.StatusBlocked, store.StatusDone, store.StatusFailed:
+		default:
+			return invalid("invalid --status %q; choose pending, running, blocked, done, failed", taskStatus)
+		}
+	}
+	if strings.TrimSpace(root) == "" {
+		return invalid("--store must not be empty")
+	}
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return fail(stderr, "resolve store root: %v", err)
+	}
+	fs, err := store.NewFileStore(root)
+	if err != nil {
+		return fail(stderr, "open store: %v", err)
+	}
+	tasks, err := fs.ListTasks(ctx, store.TaskFilter{Status: store.Status(taskStatus)})
+	if err != nil {
+		return fail(stderr, "list tasks: %v", err)
+	}
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].ID < tasks[j].ID })
+	for _, task := range tasks {
+		// Keep goals on one line and truncate by rune to preserve Unicode text.
+		goal := []rune(strings.Join(strings.Fields(task.Goal), " "))
+		if len(goal) > 80 {
+			goal = append(goal[:79], '…')
+		}
+		if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\n", task.ID, task.Status, string(goal)); err != nil {
+			return fail(stderr, "write task list: %v", err)
+		}
+	}
+	return 0
 }
 
 func runTask(ctx context.Context, task store.Task, agentName string, fs store.Store, root, webhookURL string, stdout, stderr io.Writer, agents map[string]agent.Agent, client *http.Client) int {
