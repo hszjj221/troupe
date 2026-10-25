@@ -7,12 +7,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/hszjj221/troupe/internal/agent"
+	"github.com/hszjj221/troupe/internal/notify"
 	"github.com/hszjj221/troupe/internal/orchestrator"
 	"github.com/hszjj221/troupe/internal/store"
 )
@@ -22,7 +24,7 @@ const usage = "Usage: troupe run --agent <codex|claude> --goal <goal> [flags]\nR
 // Execute runs args (excluding the executable name) and returns a process exit
 // code. It does not exit the process; callers control cancellation and output.
 func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	return execute(ctx, args, stdout, stderr, defaultAgents())
+	return execute(ctx, args, stdout, stderr, defaultAgents(), nil)
 }
 
 func defaultAgents() map[string]agent.Agent {
@@ -31,7 +33,7 @@ func defaultAgents() map[string]agent.Agent {
 	return map[string]agent.Agent{codex.Name(): codex, claude.Name(): claude}
 }
 
-func execute(ctx context.Context, args []string, stdout, stderr io.Writer, agents map[string]agent.Agent) int {
+func execute(ctx context.Context, args []string, stdout, stderr io.Writer, agents map[string]agent.Agent, client *http.Client) int {
 	if len(args) == 0 {
 		code := fail(stderr, "expected run subcommand")
 		fmt.Fprintln(stderr, usage)
@@ -47,7 +49,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, agent
 		}
 		return 0
 	case "run":
-		return run(ctx, args[1:], stdout, stderr, agents)
+		return run(ctx, args[1:], stdout, stderr, agents, client)
 	default:
 		code := fail(stderr, "unknown subcommand %q", args[0])
 		fmt.Fprintln(stderr, usage)
@@ -55,13 +57,14 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, agent
 	}
 }
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer, agents map[string]agent.Agent) int {
+func run(ctx context.Context, args []string, stdout, stderr io.Writer, agents map[string]agent.Agent, client *http.Client) int {
 	root := os.Getenv("TROUPE_HOME")
 	if root == "" {
 		root = ".troupe"
 	}
 	var task store.Task
 	var agentName string
+	var webhookURL string
 	flags := flag.NewFlagSet("troupe run", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
@@ -83,6 +86,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, agents ma
 	})
 	flags.IntVar(&task.Budget.MaxMinutes, "budget-minutes", 30, "positive agent timeout in minutes")
 	flags.StringVar(&root, "store", root, "store root (flag > TROUPE_HOME > .troupe)")
+	flags.StringVar(&webhookURL, "webhook-url", os.Getenv("TROUPE_WEBHOOK_URL"), "blocked webhook URL (flag > TROUPE_WEBHOOK_URL > empty/disabled; empty flag disables)")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -141,19 +145,24 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, agents ma
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(task.Budget.MaxMinutes)*time.Minute)
 	defer cancel()
 	result, runErr := orchestrator.New(fs, agents, filepath.Join(root, "runs")).Run(runCtx, task.ID, agentName)
+	var outputErr error
 	if result != (store.Result{}) {
 		if _, err := fmt.Fprintf(stdout, "ID: %s\nStatus: %s\nSummary: %s\nCommit: %s\nNotes: %s\n",
 			result.ID, result.Status, result.Summary, result.Commit, result.Notes); err != nil {
 			fail(stderr, "write result: %v", err)
-			if runErr == nil {
-				return 1
-			}
+			outputErr = err
 		}
 	}
 	if runErr != nil {
 		return fail(stderr, "run task %q: %v", task.ID, runErr)
 	}
-	if result.Status != store.ResultStatusDone {
+	if result.Status == store.ResultStatusBlocked {
+		n := notify.Notifier{URL: webhookURL, Client: client}
+		if err := n.NotifyBlocked(ctx, task, result); err != nil {
+			fail(stderr, "notify blocked task %q: %v", task.ID, err)
+		}
+	}
+	if outputErr != nil || result.Status != store.ResultStatusDone {
 		return 1
 	}
 	return 0

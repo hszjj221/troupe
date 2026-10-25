@@ -16,7 +16,13 @@
 // <store-root>/runs/<task-id>/<round>. Output includes the agent result's ID,
 // status, summary, commit, and notes, including any partial result on error.
 //
+// A successful orchestrator return with a blocked result also triggers one JSON
+// webhook POST. URL precedence is --webhook-url > TROUPE_WEBHOOK_URL > empty
+// (disabled); --webhook-url= disables an environment URL. Done/failed results and
+// orchestrator errors do not notify. Notification errors are printed to stderr
+// and leave the blocked exit code at 1. No retries or redirects are attempted.
+//
 // Exit 0 means a done result without errors, or help. Exit 1 means a failed or
 // blocked result, invalid usage, or any execution, persistence, or output error.
-// Blocked reasons are printed in notes; no notifications or resume are provided.
+// Blocked reasons are printed in notes; resume is not provided.
 package cli
