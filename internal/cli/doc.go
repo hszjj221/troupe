@@ -3,6 +3,8 @@
 //	troupe run --agent codex --goal "Implement a bounded task" \
 //	  --acceptance "go test ./..." --acceptance "go vet ./..."
 //	troupe resume <id> --agent codex --note "Use the proposed approach."
+//	troupe status <id> --store .troupe
+//	troupe list --status blocked
 //
 // run requires --goal and --agent (codex or claude); positional goals are not
 // accepted. --id defaults to a random t- prefixed ID; existing IDs are rejected.
@@ -20,8 +22,22 @@
 // before one more orchestrator attempt. The timeout uses the loaded task's
 // Budget.MaxMinutes, which must be positive and fit in a time.Duration.
 //
+// status requires exactly one task ID and prints ID, Status, Goal, Role, and
+// Workdir as labeled lines. Flags may appear before or after the ID. Any stored
+// status can be inspected; finding a task exits 0, including blocked/failed tasks.
+// A missing task or any store or output error exits 1 with an error on stderr.
+//
+// list prints one tab-separated ID, status, and short goal per task, sorted by
+// ID ascending, without a header. Goal whitespace is collapsed to single spaces;
+// goals longer than 80 Unicode characters are truncated to 79 followed by an
+// ellipsis. Optional --status accepts pending, running, blocked, done, or failed;
+// omitting it lists all tasks. A successful list exits 0, with empty stdout when
+// no tasks match. Invalid usage, store errors, and output errors exit 1.
+// status and list only read tasks; they do not run agents or send webhooks.
+//
 // Store precedence is --store, then nonempty TROUPE_HOME, then .troupe under the
-// current directory. Relative store and workdir paths resolve from that directory.
+// current directory for all commands; an empty --store is a usage error (exit 1).
+// Relative store and workdir paths resolve from that directory.
 // New tasks are saved pending before one orchestrator attempt; runs live under
 // <store-root>/runs/<task-id>/<round>. Output includes the agent result's ID,
 // status, summary, commit, and notes, including any partial result on error.
@@ -33,7 +49,7 @@
 // errors are printed to stderr and leave the blocked exit code at 1. No retries
 // or redirects are attempted.
 //
-// Exit 0 means a done result without errors, or help. Exit 1 means a failed or
-// blocked result, invalid usage, or any execution, persistence, or output error.
-// Blocked reasons are printed in notes.
+// For run and resume, exit 0 means a done result without errors. Exit 1 means a
+// failed or blocked result, invalid usage, or any execution, persistence, or
+// output error. Blocked reasons are printed in notes. Help exits 0 for all commands.
 package cli
