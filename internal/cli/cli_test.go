@@ -154,14 +154,163 @@ func TestRun(t *testing.T) {
 	}
 }
 
+func TestResume(t *testing.T) {
+	t.Setenv("TROUPE_WEBHOOK_URL", "")
+	for _, tt := range []struct {
+		name        string
+		agentName   string
+		args        []string
+		context     string
+		wantContext string
+		status      store.ResultStatus
+		taskStatus  store.Status
+		agentErr    error
+		code        int
+	}{
+		{
+			name: "ID before flags with reply", agentName: "codex", args: []string{"task-1", "--agent", "codex", "--note", "Use approach A."},
+			context: "Original context", wantContext: "Original context\n\nUser reply: Use approach A.",
+			status: store.ResultStatusDone, taskStatus: store.StatusDone,
+		},
+		{
+			name: "flags before ID without reply", agentName: "claude", args: []string{"--agent", "claude", "task-1"},
+			context: "Original context", wantContext: "Original context", status: store.ResultStatusDone, taskStatus: store.StatusDone,
+		},
+		{
+			name: "flags on both sides with empty context", agentName: "codex", args: []string{"--agent", "codex", "task-1", "--note", "Use approach A."},
+			wantContext: "User reply: Use approach A.", status: store.ResultStatusDone, taskStatus: store.StatusDone,
+		},
+		{
+			name: "failed", agentName: "codex", args: []string{"task-1", "--agent", "codex"},
+			status: store.ResultStatusFailed, taskStatus: store.StatusFailed, code: 1,
+		},
+		{
+			name: "error with partial result", agentName: "codex", args: []string{"task-1", "--agent", "codex"},
+			status: store.ResultStatusDone, taskStatus: store.StatusFailed, agentErr: errors.New("agent stopped"), code: 1,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			fs := openStore(t, root)
+			task := store.Task{
+				ID: "task-1", Goal: "Finish existing task", Role: "coder", Workdir: t.TempDir(),
+				Acceptance: []string{"go test ./..."}, Context: tt.context,
+				Budget: store.Budget{MaxMinutes: 2}, Status: store.StatusBlocked,
+			}
+			if err := fs.SaveTask(ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			previous := store.Run{TaskID: task.ID, N: 1, Task: task, Result: store.Result{ID: task.ID, Status: store.ResultStatusBlocked}}
+			previous.Task.Status = store.StatusRunning
+			if err := fs.SaveRun(ctx, previous); err != nil {
+				t.Fatal(err)
+			}
+			wantTask := task
+			wantTask.Context = tt.wantContext
+			wantTask.Status = store.StatusRunning
+			result := store.Result{ID: task.ID, Status: tt.status, Summary: "Resumed summary", Commit: "abc123", Notes: "Resumed notes"}
+			calls := 0
+			a := fakeAgent{name: tt.agentName, run: func(ctx context.Context, got store.Task, dir string) (store.Result, error) {
+				calls++
+				if !reflect.DeepEqual(got, wantTask) {
+					t.Fatalf("agent task = %#v; want %#v", got, wantTask)
+				}
+				if saved, err := fs.GetTask(ctx, task.ID); err != nil || !reflect.DeepEqual(saved, wantTask) {
+					t.Fatalf("persisted task at agent call = %#v, %v; want %#v", saved, err, wantTask)
+				}
+				if want := filepath.Join(root, "runs", task.ID, "2"); dir != want {
+					t.Fatalf("run directory = %q; want next round %q", dir, want)
+				}
+				deadline, ok := ctx.Deadline()
+				budget := time.Duration(task.Budget.MaxMinutes) * time.Minute
+				if remaining := time.Until(deadline); !ok || remaining > budget || remaining < budget-5*time.Second {
+					t.Fatalf("agent deadline = %v, %v; want stored budget %v", deadline, ok, budget)
+				}
+				return result, tt.agentErr
+			}}
+			other := fakeAgent{run: func(context.Context, store.Task, string) (store.Result, error) {
+				t.Fatal("ran unselected agent")
+				return store.Result{}, nil
+			}}
+			agents := map[string]agent.Agent{"codex": other, "claude": other}
+			agents[a.Name()] = a
+			args := append([]string{"resume"}, tt.args...)
+			args = append(args, "--store", root)
+			var stdout, stderr bytes.Buffer
+			code := execute(ctx, args, &stdout, &stderr, agents, nil)
+			if code != tt.code || calls != 1 {
+				t.Fatalf("exit = %d, agent calls = %d; want %d, 1; stderr: %s", code, calls, tt.code, &stderr)
+			}
+			if tt.agentErr == nil && stderr.Len() != 0 || tt.agentErr != nil && !strings.Contains(stderr.String(), tt.agentErr.Error()) {
+				t.Fatalf("stderr = %q; want error %v", &stderr, tt.agentErr)
+			}
+			wantOutput := "ID: task-1\nStatus: " + string(tt.status) + "\nSummary: Resumed summary\nCommit: abc123\nNotes: Resumed notes\n"
+			if stdout.String() != wantOutput {
+				t.Fatalf("stdout = %q; want %q", &stdout, wantOutput)
+			}
+			wantTask.Status = tt.taskStatus
+			if saved, err := fs.GetTask(ctx, task.ID); err != nil || !reflect.DeepEqual(saved, wantTask) {
+				t.Fatalf("persisted task = %#v, %v; want %#v", saved, err, wantTask)
+			}
+			wantTask.Status = store.StatusRunning
+			wantRuns := []store.Run{previous, {TaskID: task.ID, N: 2, Task: wantTask, Result: result}}
+			if runs, err := fs.ListRuns(ctx, task.ID); err != nil || !reflect.DeepEqual(runs, wantRuns) {
+				t.Fatalf("archived runs = %#v, %v; want %#v", runs, err, wantRuns)
+			}
+		})
+	}
+}
+
+func TestResumeRejectsUnresumableTasks(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		status store.Status
+		budget int
+		err    string
+	}{
+		{"pending", store.StatusPending, 2, `current status is "pending"; expected blocked`},
+		{"running", store.StatusRunning, 2, `current status is "running"; expected blocked`},
+		{"done", store.StatusDone, 2, `current status is "done"; expected blocked`},
+		{"failed", store.StatusFailed, 2, `current status is "failed"; expected blocked`},
+		{"unknown", "unknown", 2, `current status is "unknown"; expected blocked`},
+		{"empty status", "", 2, `current status is ""; expected blocked`},
+		{"zero budget", store.StatusBlocked, 0, "budget max_minutes must be between"},
+		{"negative budget", store.StatusBlocked, -1, "budget max_minutes must be between"},
+		{"overflowing budget", store.StatusBlocked, 153722868, "budget max_minutes must be between"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			fs := openStore(t, root)
+			task := store.Task{ID: "task-1", Context: "Original context", Status: tt.status, Budget: store.Budget{MaxMinutes: tt.budget}}
+			if err := fs.SaveTask(ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			a := fakeAgent{name: "codex", run: func(context.Context, store.Task, string) (store.Result, error) {
+				t.Fatal("agent ran for an unresumable task")
+				return store.Result{}, nil
+			}}
+			args := []string{"resume", task.ID, "--agent", "codex", "--store", root, "--note", "Should not be saved"}
+			var stdout, stderr bytes.Buffer
+			if code := execute(ctx, args, &stdout, &stderr, map[string]agent.Agent{a.Name(): a}, nil); code != 1 || !strings.Contains(stderr.String(), tt.err) || stdout.Len() != 0 {
+				t.Fatalf("exit = %d, stdout = %q, stderr = %q; want 1 and %q", code, &stdout, &stderr, tt.err)
+			}
+			if saved, err := fs.GetTask(ctx, task.ID); err != nil || !reflect.DeepEqual(saved, task) {
+				t.Fatalf("rejected task changed: %#v, %v; want %#v", saved, err, task)
+			}
+		})
+	}
+}
+
 func TestValidation(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		args []string
 		err  string
 	}{
-		{"no subcommand", nil, "expected run subcommand"},
-		{"unknown subcommand", []string{"resume"}, `unknown subcommand "resume"`},
+		{"no subcommand", nil, "expected run or resume subcommand"},
+		{"unknown subcommand", []string{"unknown"}, `unknown subcommand "unknown"`},
 		{"missing goal and agent", []string{"run"}, "--goal is required"},
 		{"missing goal", []string{"run", "--agent", "codex"}, "--goal is required"},
 		{"blank goal", []string{"run", "--goal", "  ", "--agent", "codex"}, "--goal is required"},
@@ -175,6 +324,15 @@ func TestValidation(t *testing.T) {
 		{"overflowing budget", []string{"run", "--goal", "task", "--agent", "codex", "--budget-minutes", "153722868"}, "--budget-minutes must be between"},
 		{"empty acceptance", []string{"run", "--goal", "task", "--agent", "codex", "--acceptance", " "}, "acceptance command must not be empty"},
 		{"empty store", []string{"run", "--goal", "task", "--agent", "codex", "--store", ""}, "--store must not be empty"},
+		{"resume missing ID and agent", []string{"resume"}, "task ID is required"},
+		{"resume missing ID", []string{"resume", "--agent", "codex"}, "task ID is required"},
+		{"resume missing agent", []string{"resume", "task-1"}, "--agent is required"},
+		{"resume unknown agent", []string{"resume", "task-1", "--agent", "missing"}, `unknown agent "missing"`},
+		{"resume extra ID", []string{"resume", "--agent", "codex", "task-1", "task-2"}, "expected exactly one task ID"},
+		{"resume extra ID after flags", []string{"resume", "task-1", "--agent", "codex", "task-2"}, "expected exactly one task ID"},
+		{"resume unknown flag", []string{"resume", "task-1", "--unknown"}, "flag provided but not defined"},
+		{"resume missing flag value", []string{"resume", "task-1", "--agent", "codex", "--note"}, "flag needs an argument"},
+		{"resume empty store", []string{"resume", "task-1", "--agent", "codex", "--store="}, "--store must not be empty"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "unused-store")
@@ -198,6 +356,12 @@ func TestValidation(t *testing.T) {
 }
 
 func TestStorePrecedence(t *testing.T) {
+	for _, command := range []string{"run", "resume"} {
+		t.Run(command, func(t *testing.T) { testStorePrecedence(t, command) })
+	}
+}
+
+func testStorePrecedence(t *testing.T, command string) {
 	for _, tt := range []struct {
 		name string
 		env  string
@@ -222,6 +386,13 @@ func TestStorePrecedence(t *testing.T) {
 				return store.Result{ID: task.ID, Status: store.ResultStatusDone}, nil
 			}}
 			args := []string{"run", "--goal", "task", "--agent", "codex", "--id", "task-1"}
+			if command == "resume" {
+				task := store.Task{ID: "task-1", Status: store.StatusBlocked, Budget: store.Budget{MaxMinutes: 2}}
+				if err := openStore(t, root).SaveTask(context.Background(), task); err != nil {
+					t.Fatal(err)
+				}
+				args = []string{"resume", "--agent", "codex", "task-1"}
+			}
 			if tt.flag != "" {
 				args = append(args, "--store", tt.flag)
 			}
@@ -296,11 +467,14 @@ func TestStoreErrors(t *testing.T) {
 }
 
 func TestHelpAndDefaultAgents(t *testing.T) {
-	for _, args := range [][]string{{"--help"}, {"run", "--help"}} {
+	for _, args := range [][]string{{"--help"}, {"run", "--help"}, {"resume", "--help"}, {"resume", "task-1", "--help"}} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			if code := Execute(context.Background(), args, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String()+stderr.String(), "Usage:") {
 				t.Fatalf("exit = %d, stdout = %q, stderr = %q; want help and exit 0", code, &stdout, &stderr)
+			}
+			if len(args) == 1 && (!strings.Contains(stdout.String(), "troupe run") || !strings.Contains(stdout.String(), "troupe resume")) {
+				t.Fatalf("top-level help must mention run and resume: %s", &stdout)
 			}
 		})
 	}
@@ -428,6 +602,94 @@ func TestBlockedWebhook(t *testing.T) {
 				if stdout.String() != wantOutput {
 					t.Fatalf("stdout = %q; want %q", &stdout, wantOutput)
 				}
+			}
+		})
+	}
+}
+
+func TestResumeBlockedWebhook(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		envURL   bool
+		flagURL  bool
+		disabled bool
+		wantPath string
+	}{
+		{name: "environment", envURL: true, wantPath: "/env"},
+		{name: "flag overrides environment", envURL: true, flagURL: true, wantPath: "/flag"},
+		{name: "empty flag disables environment", envURL: true, disabled: true},
+		{name: "no URL"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			fs := openStore(t, root)
+			task := store.Task{ID: "task-1", Goal: "Finish existing task", Status: store.StatusBlocked, Budget: store.Budget{MaxMinutes: 2}}
+			if err := fs.SaveTask(ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			type request struct {
+				method, path, contentType string
+				body                      []byte
+				err                       error
+			}
+			requests := make(chan request, 2)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				requests <- request{r.Method, r.URL.Path, r.Header.Get("Content-Type"), body, err}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+			envURL := ""
+			if tt.envURL {
+				envURL = server.URL + "/env"
+			}
+			t.Setenv("TROUPE_WEBHOOK_URL", envURL)
+			result := store.Result{ID: task.ID, Status: store.ResultStatusBlocked, Summary: "Need another decision", Notes: "请确认"}
+			calls := 0
+			a := fakeAgent{name: "codex", run: func(context.Context, store.Task, string) (store.Result, error) {
+				calls++
+				return result, nil
+			}}
+			args := []string{"resume", task.ID, "--agent", a.Name(), "--store", root}
+			if tt.flagURL {
+				args = append(args, "--webhook-url", server.URL+"/flag")
+			}
+			if tt.disabled {
+				args = append(args, "--webhook-url=")
+			}
+			var stdout, stderr bytes.Buffer
+			if code := execute(ctx, args, &stdout, &stderr, map[string]agent.Agent{a.Name(): a}, server.Client()); code != 1 || calls != 1 || stderr.Len() != 0 {
+				t.Fatalf("exit = %d, agent calls = %d, stderr = %q; want 1, 1 and no error", code, calls, &stderr)
+			}
+			if saved, err := fs.GetTask(ctx, task.ID); err != nil || saved.Status != store.StatusBlocked {
+				t.Fatalf("task after resume = %#v, %v; want blocked", saved, err)
+			}
+			wantOutput := "ID: task-1\nStatus: blocked\nSummary: Need another decision\nCommit: \nNotes: 请确认\n"
+			if stdout.String() != wantOutput {
+				t.Fatalf("stdout = %q; want %q", &stdout, wantOutput)
+			}
+			wantCalls := 0
+			if tt.wantPath != "" {
+				wantCalls = 1
+			}
+			if len(requests) != wantCalls {
+				t.Fatalf("webhook POSTs = %d; want %d", len(requests), wantCalls)
+			}
+			if wantCalls == 0 {
+				return
+			}
+			got := <-requests
+			if got.err != nil || got.method != http.MethodPost || got.path != tt.wantPath || got.contentType != "application/json" {
+				t.Fatalf("unexpected webhook request: %#v", got)
+			}
+			var payload map[string]string
+			if err := json.Unmarshal(got.body, &payload); err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]string{"task_id": task.ID, "status": "blocked", "summary": result.Summary, "notes": result.Notes, "goal": task.Goal}
+			if !reflect.DeepEqual(payload, want) {
+				t.Fatalf("payload = %#v; want %#v", payload, want)
 			}
 		})
 	}
