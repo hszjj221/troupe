@@ -28,6 +28,31 @@ leader、coder、reviewer 等都是可配置的角色：
 
 每个角色绑定哪个 agent，由用户在配置中指定。
 
+配置格式已定为 YAML，各字段均可省略：
+
+```yaml
+default_agent: codex
+roles:
+  leader: codex
+  coder: claude
+  reviewer: codex
+agents:
+  codex:
+    binary: /custom/codex
+  claude:
+    binary: claude
+```
+
+`run` / `resume` 按 `--config` → `TROUPE_CONFIG` → 当前目录的 `troupe.yaml` →
+`$TROUPE_HOME/config.yaml`（未设置 `TROUPE_HOME` 时为 `.troupe/config.yaml`）查找，
+只加载一个文件，不合并。显式路径缺失或不可读时报错；默认路径缺失时继续查找，
+均不存在则使用空配置，已存在但不可读仍报错。未指定或为空的 binary 使用 PATH 默认值。
+
+Agent 解析优先级为 `--agent` → `roles[role]` → `default_agent`，均未提供则报错；
+目前只支持 codex 和 claude。`run` 使用 `--role`，`resume` 默认使用已保存的角色，
+可用 `--role` 覆盖并保存。`--agent` 与 `--role` 同时传入时，前者选择执行器，
+后者仍保存为任务元数据。
+
 ### 2.2 协作方式
 
 协作方式也由用户选择，例如：
@@ -169,7 +194,6 @@ type Store interface {
 
 ## 9. 待定
 
-- 配置文件格式与角色绑定的具体写法。
 - 任务状态机的完整状态集合。
 - review 类型验收的设计。
 - 并行执行与失败自动切换 agent（MVP 之后）。
