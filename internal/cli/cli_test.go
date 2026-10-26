@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hszjj221/troupe/internal/agent"
+	"github.com/hszjj221/troupe/internal/config"
 	"github.com/hszjj221/troupe/internal/store"
 )
 
@@ -377,6 +378,7 @@ func TestList(t *testing.T) {
 
 func TestStatusAndListAreReadOnly(t *testing.T) {
 	t.Setenv("TROUPE_WEBHOOK_URL", "https://notify.example/blocked")
+	t.Setenv("TROUPE_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 	ctx := context.Background()
 	root := t.TempDir()
 	fs := openStore(t, root)
@@ -447,6 +449,8 @@ func TestStatusAndListErrors(t *testing.T) {
 }
 
 func TestValidation(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("TROUPE_CONFIG", "")
 	for _, tt := range []struct {
 		name string
 		args []string
@@ -457,7 +461,7 @@ func TestValidation(t *testing.T) {
 		{"missing goal and agent", []string{"run"}, "--goal is required"},
 		{"missing goal", []string{"run", "--agent", "codex"}, "--goal is required"},
 		{"blank goal", []string{"run", "--goal", "  ", "--agent", "codex"}, "--goal is required"},
-		{"missing agent", []string{"run", "--goal", "task"}, "--agent is required"},
+		{"missing agent", []string{"run", "--goal", "task"}, "need --agent or config"},
 		{"unknown agent", []string{"run", "--goal", "task", "--agent", "missing"}, `unknown agent "missing"`},
 		{"positional goal", []string{"run", "--agent", "codex", "task"}, "use --goal"},
 		{"unknown flag", []string{"run", "--unknown"}, "flag provided but not defined"},
@@ -469,8 +473,6 @@ func TestValidation(t *testing.T) {
 		{"empty store", []string{"run", "--goal", "task", "--agent", "codex", "--store", ""}, "--store must not be empty"},
 		{"resume missing ID and agent", []string{"resume"}, "task ID is required"},
 		{"resume missing ID", []string{"resume", "--agent", "codex"}, "task ID is required"},
-		{"resume missing agent", []string{"resume", "task-1"}, "--agent is required"},
-		{"resume unknown agent", []string{"resume", "task-1", "--agent", "missing"}, `unknown agent "missing"`},
 		{"resume extra ID", []string{"resume", "--agent", "codex", "task-1", "task-2"}, "expected exactly one task ID"},
 		{"resume extra ID after flags", []string{"resume", "task-1", "--agent", "codex", "task-2"}, "expected exactly one task ID"},
 		{"resume unknown flag", []string{"resume", "task-1", "--unknown"}, "flag provided but not defined"},
@@ -637,6 +639,7 @@ func TestStoreErrors(t *testing.T) {
 }
 
 func TestHelpAndDefaultAgents(t *testing.T) {
+	t.Setenv("TROUPE_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
 	for _, args := range [][]string{{"--help"}, {"-h"}, {"help"}, {"run", "--help"}, {"resume", "--help"}, {"resume", "task-1", "--help"}, {"status", "--help"}, {"status", "task-1", "--help"}, {"list", "--help"}} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -652,9 +655,15 @@ func TestHelpAndDefaultAgents(t *testing.T) {
 			} else if !strings.Contains(stderr.String(), "Usage: troupe "+args[0]) {
 				t.Fatalf("command help must mention %s: %s", args[0], &stderr)
 			}
+			if len(args) == 1 || args[0] == "run" || args[0] == "resume" {
+				help := stdout.String() + stderr.String()
+				if !strings.Contains(help, "--config") || !strings.Contains(help, "role binding") || !strings.Contains(help, "default_agent") {
+					t.Fatalf("help must describe config agent selection: %s", help)
+				}
+			}
 		})
 	}
-	registered := defaultAgents()
+	registered := agentsFromConfig(config.Config{})
 	if len(registered) != 2 {
 		t.Fatalf("registered agents = %v; want codex and claude", registered)
 	}

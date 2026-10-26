@@ -6,21 +6,30 @@
 //	troupe status <id> --store .troupe
 //	troupe list --status blocked
 //
-// run requires --goal and --agent (codex or claude); positional goals are not
-// accepted. --id defaults to a random t- prefixed ID; existing IDs are rejected.
-// --role defaults to empty and does not select the agent. --workdir defaults to
-// the current directory, --context to empty, and repeatable --acceptance flags
-// preserve each command as one string. --budget-minutes defaults to 30 and sets
-// the agent timeout as well as task.Budget; it must be positive.
+// run requires --goal; positional goals are not accepted. --id defaults to a
+// random t- prefixed ID; existing IDs are rejected. --role defaults to empty.
+// --workdir defaults to the current directory, --context to empty, and repeatable
+// --acceptance flags preserve each command as one string. --budget-minutes
+// defaults to 30 and sets the agent timeout as well as task.Budget; it must be
+// positive.
 //
-// resume requires exactly one task ID and --agent (codex or claude). The agent
-// must be re-specified because tasks do not store the last agent. Flags may
-// appear before or after the ID. Only blocked tasks can resume; other statuses
-// are rejected without changing the task. Optional --note appends a labeled
-// user reply to Context, separated from existing context by a blank line, and
-// saves it while still blocked. The task then transitions blocked to pending
-// before one more orchestrator attempt. The timeout uses the loaded task's
-// Budget.MaxMinutes, which must be positive and fit in a time.Duration.
+// resume requires exactly one task ID. Flags may appear before or after the ID.
+// Only blocked tasks can resume; other statuses are rejected without changing
+// the task. Optional --note appends a labeled user reply to Context, separated
+// from existing context by a blank line, and saves it while still blocked.
+// Optional --role replaces the stored task role, including when explicitly
+// empty, and is also saved before running. The task then transitions blocked to
+// pending before one more orchestrator attempt. The timeout uses the loaded
+// task's Budget.MaxMinutes, which must be positive and fit in a time.Duration.
+//
+// run and resume select an agent by --agent, then the config binding for the
+// task role, then default_agent; no match is a usage error. --agent always wins
+// while --role still sets task metadata. resume uses the stored role unless
+// --role is passed; tasks do not store the last agent. Only codex and claude
+// are supported. Config agents.<name>.binary overrides their PATH defaults.
+// YAML config lookup is --config, TROUPE_CONFIG, ./troupe.yaml, then config.yaml
+// under TROUPE_HOME or .troupe. One file is loaded without merging; only missing
+// implicit paths are ignored. Config lookup is independent of --store/--workdir.
 //
 // status requires exactly one task ID and prints ID, Status, Goal, Role, and
 // Workdir as labeled lines. Flags may appear before or after the ID. Any stored
